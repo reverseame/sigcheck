@@ -1,0 +1,4 @@
+*.pyc
+catroot/
+.vscode/
+test/
