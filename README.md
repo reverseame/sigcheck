@@ -6,7 +6,7 @@ Microsoft Authenticode is the code-signing standard used by Windows to digitally
 
 ### Sigvalidator
 
-`sigvalidator` module allows you to directly verify executable files:
+As a side product, we have also developed an independent Python module to verify signatures of PE files:
 
 ```python
 import pefile
@@ -27,7 +27,7 @@ invoice.exe.mlwr: Self signed certificate in certificate chain
 CFF Explorer.exe: Not signed file
 ```
 
-## Instalation
+## Installation
 
 You can install all dependencies with [setup.sh](setup.sh):
 
@@ -79,4 +79,4 @@ rspndr.sys                     0 Verification successful (catalog-signed)
 
 ## License
 
-Licensed under the [GNU GPLv3](LICENSE.txt) license.
+Licensed under the [GNU GPLv3](LICENSE) license.
