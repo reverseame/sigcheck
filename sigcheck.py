@@ -17,16 +17,10 @@ along with sigcheck.  If not, see <https://www.gnu.org/licenses/>.
 
 import os
 import re
-import sys
-import glob
 import json
 import pefile
-import shutil
 import struct
-import hashlib
-import binascii
-import tempfile
-import subprocess
+import sigvalidator
 
 from io import BytesIO
 from enum import Enum
@@ -73,35 +67,33 @@ class ReturnCode(Enum):
 
 class SigCheck(AbstractWindowsCommand):
     '''
-    Attempts to validate Authenticode-signed processes, either with embedded signature or catalog-signed
+    Aims to validate Authenticode-signed processes, either with embedded signature or catalog-signed
 
     Options:
         --catalog [dir]: directory containing catalog files (.cat), default to '$PWD/catroot/$VOL_PROFILE'
+        --dll: verify library modules (.dll)
+        --sys: verify driver modules (.sys)
     '''
 
     def __init__(self, config, *args, **kwargs):
         '''
-        Plugin creation, it creates temorary files to later working on them
+        Plugin creation
         '''
 
         AbstractWindowsCommand.__init__(self, config, *args, **kwargs)
+
         self.__plugin_name, _ = os.path.splitext(os.path.basename(__file__))
         default_catlog_dir = os.path.join('catroot', self._config.get_value("PROFILE"))
         self._config.add_option('CATALOG', help='Catalog dir to search signature into, default to \'$PWD/catroot/$VOL_PROFILE\'', action='store', type='string', default=default_catlog_dir)
-        self._config.add_option('DLL', help='Also verify DLL modules (.dll)', action='store_true')
-        self._config.add_option('SYS', help='Also verify driver modules (.sys)', action='store_true')
+        self._config.add_option('DLL', help='Verify DLL modules (.dll)', action='store_true')
+        self._config.add_option('SYS', help='Verify driver modules (.sys)', action='store_true')
         self.addr_space = utils.load_as(self._config)
+
         self.files = []
         self.frequent_addresses = self.load_frequent_addresses()
-
-        self.check_args()
-
-        _, self.temp_filename = tempfile.mkstemp()
-        _, self.file_cert = tempfile.mkstemp()
-        _, self.file_signed_data = tempfile.mkstemp()
-
         # Simple cache
         self.already_analyzed = {}
+        self.sigv = None
 
     def load_frequent_addresses(self):
         try:
@@ -136,55 +128,41 @@ class SigCheck(AbstractWindowsCommand):
         @return a tuple of process name, process identifier, and process verification result
         '''
 
-        try:
-            modules = []
+        self.check_args()
+        self.sigv = sigvalidator.SigValidator(self._config.catalog)
+        modules = []
 
-            if self._config.SYS:
-                modules += self.get_sys_modules()
-            else:
-                for task in tasks.pslist(self.addr_space):
-                    modules += self.get_pe_modules(task, dlls=self._config.DLL)
+        if self._config.SYS:
+            modules += self.get_sys_modules()
+        else:
+            for task in tasks.pslist(self.addr_space):
+                modules += self.get_pe_modules(task, dlls=self._config.DLL)
 
-            if modules:
-                self.files = self.get_files()
+        if modules:
+            self.files = self.get_files()
 
-                for module in modules:
-                    module_path, module_name, pid = module
-                    if module_path in self.already_analyzed:
-                        yield module_name, pid, self.already_analyzed[module_path]
-                    else:
-                        if module_path:
-                            is_complete, file_object = self.get_file_object(module_path)
-                            # We found a complete FileObject to work on
-                            if is_complete:
-                                result = self.validate_file(file_object)
-                                self.already_analyzed[module_path] = result
-                                yield module_name, pid, result
-                            # We are restricted to likely find signature in last page
-                            else:
-                                result = self.validate_partial_file(file_object)
-                                self.already_analyzed[module_path] = result
-                                yield module_name, pid, result
-                        # Sometimes, terminated processes are still listed
-                        elif task.ExitTime:
-                            yield task.ImageFileName, pid, ReturnCode.ALREADY_TERMINATED
+            for module in modules:
+                module_path, module_name, pid = module
+                if module_path in self.already_analyzed:
+                    yield module_name, pid, self.already_analyzed[module_path]
+                else:
+                    if module_path:
+                        is_complete, file_object = self.get_file_object(module_path)
+                        # We found a complete FileObject to work on
+                        if is_complete:
+                            result = self.validate_file(file_object)
+                            self.already_analyzed[module_path] = result
+                            yield module_name, pid, result
+                        # We are restricted to likely find signature in last page
                         else:
-                            yield task.ImageFileName, pid, ReturnCode.NOT_PEB
-        finally:
-            self.clean_workin_dir()
-
-    def clean_workin_dir(self):
-        '''
-        Deletes temporary files
-        '''
-
-        self.delete_file(self.temp_filename)
-        self.delete_file(self.file_cert)
-        self.delete_file(self.file_signed_data)
-
-    def delete_file(self, path):
-        if os.path.exists(path):
-            os.remove(path)
+                            result = self.validate_partial_file(file_object)
+                            self.already_analyzed[module_path] = result
+                            yield module_name, pid, result
+                    # Sometimes, terminated processes are still listed
+                    elif task.ExitTime:
+                        yield task.ImageFileName, pid, ReturnCode.ALREADY_TERMINATED
+                    else:
+                        yield task.ImageFileName, pid, ReturnCode.NOT_PEB
 
     def get_files(self):
         '''
@@ -222,9 +200,9 @@ class SigCheck(AbstractWindowsCommand):
             for mod in task.get_load_modules():
                 ret += [(str(mod.FullDllName), str(mod.BaseDllName), int(task.UniqueProcessId))]
         else:
-            if task.Peb:
-                for mod in task.get_load_modules():
-                    return [(str(mod.FullDllName), str(mod.BaseDllName), int(task.UniqueProcessId))]
+            for mod in task.get_load_modules():
+                # Return first module (.exe in InLoadOrderModuleList)
+                return [(str(mod.FullDllName), str(mod.BaseDllName), int(task.UniqueProcessId))]
 
         return ret
 
@@ -264,10 +242,10 @@ class SigCheck(AbstractWindowsCommand):
         if filename:
             # Use same notation
             filename = self.normalize_filepath(filename)
-            for file in self.files:
+            for f in self.files:
                 # We consider they are the same file if executable path and file object path match
-                if re.match(r'^{0}$'.format(filename), file['name'], flags=re.IGNORECASE):
-                    return self.extract_object(file)
+                if re.match(r'^{0}$'.format(filename), f['name'], flags=re.IGNORECASE):
+                    return self.extract_object(f)
 
         return False, None
 
@@ -302,7 +280,7 @@ class SigCheck(AbstractWindowsCommand):
         @return a FileObject
         '''
 
-        self._config.DUMP_DIR = '.'                             # Dummy value
+        self._config.DUMP_DIR = '.'     # Dummy value
         self._config.PHYSOFFSET =  hex(file_object['offset'])
         dumper = dumpfiles.DumpFiles(self._config)
 
@@ -377,7 +355,6 @@ class SigCheck(AbstractWindowsCommand):
         return content
 
     def validate_image_section(self, content, file_type):
-        # TODO: refactor
         content = self.delete_padding(content)
         pe = pefile.PE(data=content, fast_load=True)
         is_32bits = self.is_32bits(content)
@@ -407,23 +384,24 @@ class SigCheck(AbstractWindowsCommand):
         return ReturnCode.PE_REBUILT_FAILED
 
     def verify_pe(self, pe):
-        cert = self.extract_cert(pe)
+        cert = self.sigv.extract_cert(pe)
         if cert:
-            algorithm, hash_file = self.get_digest_from_signature(cert)
+            algorithm, hash_file = self.sigv.get_digest_from_signature(cert)
             if algorithm:
-                digest = self.calculate_pe_digest(algorithm, pe.__data__)
+                digest = self.sigv.calculate_pe_digest(algorithm, pe.__data__)
                 if hash_file == digest:
-                    return self.verify_signature(cert)
+                    return self.sigv.verify_signature(cert)
                 else:
                     return ReturnCode.AUTHENTICODE_SIGNATURE_MISMATCH
             else:
                 return ReturnCode.PARTIAL_CERTIFICATE
         else:
-            digest = self.calculate_pe_digest('sha1', pe.__data__)
-            if self.is_in_catalog(digest):
-                return ReturnCode.CATALOG_SIGNED
-            else:
-                return ReturnCode.NOT_SIGNED
+            for algorithm in ['md5', 'sha1', 'sha256']:
+                digest = self.sigv.calculate_pe_digest(algorithm, pe.__data__)
+                if self.sigv.is_in_catalog(digest):
+                    return ReturnCode.CATALOG_SIGNED
+
+            return ReturnCode.NOT_SIGNED
 
     def get_imagebase(self, content):
         nt_headers_addr = self.get_nt_header_addr(content)
@@ -461,67 +439,6 @@ class SigCheck(AbstractWindowsCommand):
             if section.Name.rstrip('\x00') == section_name:
                 return section
 
-    def get_digest_from_signature(self, signature):
-        # $ openssl asn1parse -inform DER -in signature.der
-        # https://github.com/torvalds/linux/blob/450313c5d1313e79059031e6185174616f7ea329/lib/oid_registry_data.c
-
-        # OID_signed_data = binascii.unhexlify('2a864886f70d010702') # pkcs7-signedData
-
-        OID_md5 = binascii.unhexlify('2a864886f70d0205')            # md5
-        OID_sha1 = binascii.unhexlify('2b0e03021a')                 # sha1
-        OID_sha256 = binascii.unhexlify('608648016503040201')       # sha256
-
-        match = CERTIFICATE_REGEX.search(signature)
-
-        if match:
-            oid_algorithm = match.group('oid_algorithm')
-            hash_size = ord(match.group('hash_size'))
-            where = match.end()
-
-            digest = signature[where:where+hash_size]
-
-            if oid_algorithm == OID_md5:
-                return 'md5', digest
-            elif oid_algorithm == OID_sha1:
-                return 'sha1', digest
-            elif oid_algorithm == OID_sha256:
-                return 'sha256', digest
-        else:
-            return None, 0x00
-
-    def verify_signature(self, signature):
-        SPC_PE_IMAGE_DATA_OBJID = '1.3.6.1.4.1.311.2.1.15'
-
-        self.save_data(self.file_cert, signature)
-
-        # openssl asn1parse -inform DER -in /tmp/tmp0UGO2s
-        process = subprocess.Popen(['openssl', 'asn1parse', '-inform', 'DER', '-in', self.file_cert], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        output = process.communicate()[0].decode("utf-8").split('\n')
-
-        where = [i for i, item in enumerate(output) if SPC_PE_IMAGE_DATA_OBJID in item]
-
-        if where:
-            match = OPENSSL_REGEX.search(output[where[0]-2])
-
-            offset = int(match.group('offset'))
-            header_length = int(match.group('header_length'))
-            length = int(match.group('length'))
-
-            content = signature[offset+header_length:offset+header_length+length]
-            self.save_data(self.file_signed_data, content)
-
-            process = subprocess.Popen(['openssl', 'smime', '-verify', '-inform', 'DER', '-in', self.file_cert,
-                                        '-binary', '-content', self.file_signed_data, '-purpose', 'any', '-CApath',
-                                        '/etc/ssl/certs/', '-out', '/tmp/dummy.txt'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-            output = process.communicate()[1].decode("utf-8").split(':')[-1].replace('\n', '')
-
-            # Capitalize first letter
-            return output[0].upper() + output[1:]
-        else:
-            result = [item for item in output if item][-1]
-            return result
-
     def validate_data_section(self, content):
         '''
         Validate signature of a DataSectionObject
@@ -538,55 +455,24 @@ class SigCheck(AbstractWindowsCommand):
         # Ensure there are no extraction errors
         if pe.verify_checksum():
             # Files can has an embedded signature
-            cert = self.extract_cert(pe)
+            cert = self.sigv.extract_cert(pe)
             if cert:
-                algorithm, hash_file = self.get_digest_from_signature(cert)
-                digest = self.calculate_pe_digest(algorithm, content)
+                algorithm, hash_file = self.sigv.get_digest_from_signature(cert)
+                digest = self.sigv.calculate_pe_digest(algorithm, content)
                 if hash_file == digest:
-                    return self.verify_signature(cert)
+                    return self.sigv.verify_signature(cert)
                 else:
                     return ReturnCode.AUTHENTICODE_SIGNATURE_MISMATCH
             # Or files can has a signature in a separate catalog file
             else:
                 # Calculate algorithm hash to later search in catalog files
-                digest = self.calculate_pe_digest('sha1', content)
-                if self.is_in_catalog(digest):
-                    return ReturnCode.CATALOG_SIGNED
-                else:
-                    return ReturnCode.NOT_SIGNED
+                for algorithm in ['md5', 'sha1', 'sha256']:
+                    digest = self.sigv.calculate_pe_digest(algorithm, content)
+                    if self.sigv.is_in_catalog(digest):
+                        return ReturnCode.CATALOG_SIGNED
+                return ReturnCode.NOT_SIGNED
         else:
             return ReturnCode.PE_CHECKSUM_MISMATCH
-
-    def calculate_pe_digest(self, algorithm, raw_data):
-        '''
-        Calculate Authenticode hash given an algorithm
-
-        @param algoritm: md5, sha1, sha256, or other function contained in hashlib
-        @param raw_data: PE raw data
-
-        @return calculated hash string
-        '''
-
-        # Skip parts omitted by Authenticode hash algorithm
-        # http://download.microsoft.com/download/9/c/5/9c5b2167-8017-4bae-9fde-d599bac8184a/authenticode_pe.docx
-
-        nt_headers_addr = self.get_nt_header_addr(raw_data)
-        checksum_addr = nt_headers_addr + 0x58
-
-        certificate_table_addr, certificate_virtual_addr, certificate_size = self.get_pe_certificate_attibutes(raw_data)
-
-        # PE header except OptionalHeader.CheckSum and OptionalHeader.SecurityDirectoryEntry, because those fields are modified
-        # due to the sign process itself
-        data = raw_data[:checksum_addr] + raw_data[checksum_addr+0x04:certificate_table_addr]
-
-        # Skip only embedded signature, there can be data after it
-        if (certificate_virtual_addr and certificate_size) != 0x0:
-            data += raw_data[certificate_table_addr+0x08:certificate_virtual_addr] + raw_data[certificate_virtual_addr+certificate_size:]
-        # Or don't skip anything if signature is not present
-        else:
-            data += raw_data[certificate_table_addr+0x08:]
-
-        return getattr(hashlib, algorithm)(data).digest()
 
     def get_nt_header_addr(self, pe_data):
         '''
@@ -602,26 +488,6 @@ class SigCheck(AbstractWindowsCommand):
             if nt_headers == b'\x50\x45\x00\x00':   # PE
                 return nt_headers_addr
 
-    def get_pe_certificate_attibutes(self, pe_data):
-        '''
-        Gets SecurityDirectoryEntry offset and its attributes
-
-        @param pe_data: PE raw data
-
-        @return tuple with SecurityDirectoryEntry offset, SecurityDirectoryEntry.VirtualAddress, SecurityDirectoryEntry.Size
-        '''
-        nt_headers = self.get_nt_header_addr(pe_data)
-
-        if self.is_32bits(pe_data):
-            certificate_table_addr = nt_headers + 0x98
-        elif self.is_64bits(pe_data):
-            certificate_table_addr = nt_headers + 0xa8
-
-        certificate_virtual_addr = self.unpack_dword(pe_data[certificate_table_addr:certificate_table_addr+0x04])
-        certificate_size = self.unpack_dword(pe_data[certificate_table_addr+0x04:certificate_table_addr+0x08])
-
-        return certificate_table_addr, certificate_virtual_addr, certificate_size
-
     def unpack_dword(self, bytes_):
         return struct.unpack('<I', bytes_)[0]
 
@@ -633,38 +499,6 @@ class SigCheck(AbstractWindowsCommand):
 
     def pack_qword(self, bytes_):
         return struct.pack('<Q', bytes_)
-
-    def is_in_catalog(self, digest):
-        files = self.get_files_by_extension(self._config.catalog, '.cat')
-
-        if files:
-            for file in files:
-                data = self.read_data(file)
-                for match in CERTIFICATE_REGEX.finditer(data):
-                    oid_algorithm = match.group('oid_algorithm')
-                    hash_size = ord(match.group('hash_size'))
-                    where = match.end()
-
-                    hash_digest = data[where:where+hash_size]
-
-                    if digest == hash_digest:
-                        return True
-        else:
-            self.__debug_message('warning', 'Catalog path: \'{0}\': It doesn\'t contain catalog files (.cat)'.format(os.path.realpath(self._config.catalog)))
-
-        return False
-
-    def get_files_by_extension(self, path, extension):
-        ret = []
-
-        if os.path.isdir(path):
-            for root, _, files in os.walk(path):
-                for f in files:
-                    _, ext = os.path.splitext(f)
-                    if ext == extension:
-                        ret += [os.path.join(root, f)]
-
-        return ret
 
     def delete_padding(self, content):
         '''
@@ -702,35 +536,16 @@ class SigCheck(AbstractWindowsCommand):
 
         return size
 
-    def extract_cert(self, pe):
-        '''
-        Extracts Authenticode certificate specified in Security directory entry
-
-        @param pe: pefile.PE object
-
-        @return Authenticode signature
-        '''
-
-        security_directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']]
-
-        if self.has_cert(pe):
-            return pe.__data__[security_directory.VirtualAddress:security_directory.VirtualAddress+security_directory.Size]
-
-    def has_cert(self, pe):
-        security_directory = pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']]
-
-        return (security_directory.Size and security_directory.VirtualAddress) != 0x0
-
     def validate_partial_file(self, file_object):
         if file_object:
             content = self.read_file_memory(file_object)
             try:
                 pe = pefile.PE(data=content, fast_load=True)
-                if self.has_cert(pe):
+                if self.sigv.has_cert(pe):
                     if file_object['type'] == 'DataSectionObject':
-                        cert = self.extract_cert(pe)
+                        cert = self.sigv.extract_cert(pe)
                         if cert:
-                            return '{0:s}. Signature verification: {1}'.format(ReturnCode.PARTIAL_CONTENT_VERIFIED, self.verify_signature(cert))
+                            return '{0:s}. Signature verification: {1}'.format(ReturnCode.PARTIAL_CONTENT_VERIFIED, self.sigv.verify_signature(cert))
                         else:
                             return ReturnCode.CONTENT_SIGNED_NOT_VERIFIED
                     # SecurityDirectory entry is not mappped into memory in ImageSectionObject
@@ -746,14 +561,6 @@ class SigCheck(AbstractWindowsCommand):
                 return ReturnCode.PARTIAL_CONTENT_PE_DATA_ERROR
         else:
             return ReturnCode.FILEOBJECT_ERROR
-
-    def read_data(self, filename):
-        with open(filename, 'rb') as f:
-            return f.read()
-
-    def save_data(self, filename, file_content):
-        with open(filename, 'wb') as f:
-            f.write(file_content)
 
     def __debug_message(self, type_, message):
         getattr(debug, type_)('{0}\t: {1}'.format(self.__plugin_name, message))

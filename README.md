@@ -2,7 +2,7 @@
 
 `sigcheck` for Volatility 2.6 aims to verify digital signatures of executable files (namely, .exe, .dll, and .sys files) in memory dumps. It is named after the [Microsoft's tool](https://docs.microsoft.com/en-us/sysinternals/downloads/sigcheck) that verifies digital signatures on binary files.
 
-Microsoft Authenticode is the code-signing standard used by Windows to digitally sign files that adopt the Windows portable executable (PE) format (you can find more details in [documentation](http://download.microsoft.com/download/9/c/5/9c5b2167-8017-4bae-9fde-d599bac8184a/authenticode_pe.docx)). These executables are signed either with embedded signature or catalog-signed; in order to verfiy the last, you **must** provide all catalog files (.cat) corresponding to your Windows version (located in `system32/catroot`).
+Microsoft Authenticode is the code-signing standard used by Windows to digitally sign files that adopt the Windows portable executable (PE) format (you can find more details in [documentation](http://download.microsoft.com/download/9/c/5/9c5b2167-8017-4bae-9fde-d599bac8184a/authenticode_pe.docx)). These executables are signed either with embedded signature or catalog-signed; in order to verfiy the last, you **must** provide all catalog files (.cat) corresponding to your Windows version, located in `system32/catroot` (you can download catalog files extracted from [Win7SP1x86](https://drive.google.com/file/d/1l01L6A2YO9F9a9weo55PA_A_YeTZ-qBo/view?usp=sharing), [Win7SP1x64](https://drive.google.com/file/d/1CRMcOEDwN8P732EyQlNaY34ZUDuIWsyL/view?usp=sharing)).
 
 ### Sigvalidator
 
@@ -14,14 +14,14 @@ import sigvalidator
 
 sigv = sigvalidator.SigValidator()
 
-for path in ['Firefox Setup 69.0.2.exe', 'procexp.exe', 'invoice.exe.mlwr', 'CFF Explorer.exe']:
+for path in ['Firefox Setup 77.0.exe', 'procexp.exe', 'invoice.exe.mlwr', 'CFF Explorer.exe']:
     pe = pefile.PE(path, fast_load=True)
     result = sigv.verify_pe(pe)
     print '{0}: {1}'.format(path, result)
 ```
 
 ```
-Firefox Setup 69.0.2.exe: Verification successful
+Firefox Setup 77.0.exe: Verification successful
 procexp.exe: Certificate has expired
 invoice.exe.mlwr: Self signed certificate in certificate chain
 CFF Explorer.exe: Not signed file
@@ -31,7 +31,7 @@ CFF Explorer.exe: Not signed file
 
 You can install all dependencies with [setup.sh](setup.sh):
 
-- System: `openssl`
+- System: `openssl=1.1.0l`
 - Python 2.7: `pefile>=2019.4.18`, `pycrypto`, `enum34`
 
 ## Usage
