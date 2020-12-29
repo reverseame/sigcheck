@@ -86,7 +86,7 @@ class SigCheck(AbstractWindowsCommand):
 
         AbstractWindowsCommand.__init__(self, config, *args, **kwargs)
         self.__plugin_name, _ = os.path.splitext(os.path.basename(__file__))
-        default_catlog_dir = os.path.join('catroot', self._config.get_value("PROFILE"))
+        default_catlog_dir = self._get_directory_file(os.path.join('catroot', self._config.get_value("PROFILE")))
         self._config.add_option('CATALOG', help='Catalog dir to search signature into, default to \'$PWD/catroot/$VOL_PROFILE\'', action='store', type='string', default=default_catlog_dir)
         self._config.add_option('DLL', help='Also verify DLL modules (.dll)', action='store_true')
         self._config.add_option('SYS', help='Also verify driver modules (.sys)', action='store_true')
@@ -105,7 +105,7 @@ class SigCheck(AbstractWindowsCommand):
 
     def load_frequent_addresses(self):
         try:
-            address_file = 'addresses.json'
+            address_file = self._get_directory_file('addresses.json')
             profile = self._config.get_value("PROFILE")
             data = self.load_json(address_file)
 
@@ -117,6 +117,9 @@ class SigCheck(AbstractWindowsCommand):
             return data[key]
         except IOError:
             self.__debug_message('error', 'Unable to load most frequent addresses (\'{0}\' file) '.format(address_file))
+
+    def _get_directory_file(self, filename):
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
 
     def load_json(self, path):
         with open(path, 'r') as f:
