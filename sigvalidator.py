@@ -49,7 +49,7 @@ class ReturnCode(Enum):
         return self.value[1]
 
 class SigValidator:
-    def __init__(self, catalog):
+    def __init__(self, catalog=None):
         self.catalog = catalog
 
         _, self.file_signature = tempfile.mkstemp()
@@ -73,15 +73,17 @@ class SigValidator:
                 else:
                     return ReturnCode.AUTHENTICODE_SIGNATURE_MISMATCH
         else:
-            digest = self.calculate_pe_digest('sha1', pe.__data__)
+            if self.catalog:
+                for algorithm in ['md5', 'sha1', 'sha256']:
+                    digest = self.calculate_pe_digest(algorithm, pe.__data__)
 
-            if self.is_in_catalog(digest):
-                return ReturnCode.CATALOG_SIGNED
+                    if self.is_in_catalog(digest):
+                        return ReturnCode.CATALOG_SIGNED
+
+            if rebuilt:
+                return ReturnCode.NOT_SIGNED_OR_INCORRECT_IMAGEBASE
             else:
-                if rebuilt:
-                    return ReturnCode.NOT_SIGNED_OR_INCORRECT_IMAGEBASE
-                else:
-                    return ReturnCode.NOT_SIGNED
+                return ReturnCode.NOT_SIGNED
 
     def clean_workin_dir(self):
         '''
@@ -140,7 +142,7 @@ class SigValidator:
 
             if result:
                 # Capitalize first letter
-                return result[0].upper() + result[1:]
+                return result.capitalize()
             else:
                 return ReturnCode.VERIFICATION_ERROR
         else:
@@ -281,7 +283,7 @@ class SigValidator:
         for f in files:
             data = self.read_data(f)
             for match in CERTIFICATE_REGEX.finditer(data):
-                # oid_algorithm = match.group('oid_algorithm')
+                oid_algorithm = match.group('oid_algorithm')
                 hash_size = ord(match.group('hash_size'))
                 where = match.end()
 
