@@ -321,7 +321,19 @@ class SigCheck(AbstractWindowsCommand):
             return self.validate_data_section(content)
 
     def get_pe_type(self, file_object):
-        return file_object['name'].split('.')[-1].lower()
+        extension = file_object['name'].split('.')[-1].lower()
+
+        if not self._config.SYS and not self._config.DLL:
+            return 'exe'
+        elif self._config.SYS:
+            return 'sys'
+        elif self._config.DLL:
+            if extension == 'exe':
+                return 'exe'
+            else:
+                return 'dll'
+
+        return extension
 
     def read_file_memory(self, file_object):
         '''
@@ -365,24 +377,27 @@ class SigCheck(AbstractWindowsCommand):
         if pe.verify_checksum():
             return self.verify_pe(pe)
 
-        for new_imagebase in self.frequent_addresses[file_type]:
-            new_imagebase = int(new_imagebase, 16)
+        if file_type in self.frequent_addresses:
+            for new_imagebase in self.frequent_addresses[file_type]:
+                new_imagebase = int(new_imagebase, 16)
 
-            if is_32bits and new_imagebase > 0xffffffff:
-                continue
+                if is_32bits and new_imagebase > 0xffffffff:
+                    continue
 
-            try:
-                pe = pefile.PE(data=content, fast_load=True)
-                pe.relocate_image(new_imagebase)
-                new_content = self.set_imagebase(new_imagebase, pe.__data__)
-                pe = pefile.PE(data=new_content, fast_load=True)
+                try:
+                    pe = pefile.PE(data=content, fast_load=True)
+                    pe.relocate_image(new_imagebase)
+                    new_content = self.set_imagebase(new_imagebase, pe.__data__)
+                    pe = pefile.PE(data=new_content, fast_load=True)
 
-                if pe.verify_checksum():
-                    return self.verify_pe(pe)
-            # AttributeError: Some PE files doesn't have relocation table
-            # struct.error: Some times pe.get_data_from_qword() fails during relocation
-            except (AttributeError, struct.error):
-                pass
+                    if pe.verify_checksum():
+                        return self.verify_pe(pe)
+                # AttributeError: Some PE files doesn't have relocation table
+                # struct.error: Some times pe.get_data_from_qword() fails during relocation
+                except (AttributeError, struct.error):
+                    pass
+        else:
+            self.__debug_message('warning', '\'{}\':  File extension not supported for reconstruction'.format(file_type))
 
         return ReturnCode.PE_REBUILT_FAILED
 
