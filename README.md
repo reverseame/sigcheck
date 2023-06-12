@@ -4,6 +4,8 @@
 
 Microsoft Authenticode is the code-signing standard used by Windows to digitally sign files that adopt the Windows portable executable (PE) format (you can find more details in [documentation](http://download.microsoft.com/download/9/c/5/9c5b2167-8017-4bae-9fde-d599bac8184a/authenticode_pe.docx)). These executables are signed either with embedded signature or catalog-signed; in order to verfiy the last, you **must** provide all catalog files (.cat) corresponding to your Windows version, located in `system32/catroot` (you can download catalog files extracted from [Win7SP1x86](https://drive.google.com/file/d/1l01L6A2YO9F9a9weo55PA_A_YeTZ-qBo/view?usp=sharing), [Win7SP1x64](https://drive.google.com/file/d/1CRMcOEDwN8P732EyQlNaY34ZUDuIWsyL/view?usp=sharing)).
 
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+
 ### Sigvalidator
 
 As a side product, we have also developed an independent Python module to verify signatures of PE files:
