@@ -17,6 +17,7 @@ along with sigcheck.  If not, see <https://www.gnu.org/licenses/>.
 
 import os
 import re
+import time
 import pefile
 import struct
 import hashlib
@@ -69,7 +70,14 @@ class SigValidator:
         os.close(fd_out)
 
     def __del__(self):
-        self.clean_workin_dir()
+        # Cleanup runs during garbage collection / interpreter shutdown, where
+        # raising is pointless (the exception would only be printed as
+        # "Exception ignored in ...") and where a partially initialised object
+        # may be missing attributes. Never let cleanup raise.
+        try:
+            self.clean_workin_dir()
+        except Exception:
+            pass
 
     def verify_pe(self, pe, rebuilt=False):
         cert = self.extract_cert(pe)
@@ -100,16 +108,37 @@ class SigValidator:
 
     def clean_workin_dir(self):
         '''
-        Deletes temporary files
+        Deletes temporary files (best effort)
         '''
 
-        self.delete_file(self.file_signature)
-        self.delete_file(self.file_signed_data)
-        self.delete_file(self.file_output)
+        for attr in ('file_signature', 'file_signed_data', 'file_output'):
+            path = getattr(self, attr, None)
+            if path:
+                self.delete_file(path)
 
-    def delete_file(self, path):
-        if os.path.exists(path):
-            os.remove(path)
+    def delete_file(self, path, retries=5, delay=0.1):
+        '''
+        Best-effort deletion of a temporary file.
+
+        On Windows another process (typically an antivirus scanning the freshly
+        created file) may briefly hold a handle, which makes os.remove fail with
+        PermissionError (WinError 32). Retry a few times and, if the file still
+        cannot be removed, give up silently: it lives in the system temporary
+        directory and will eventually be reclaimed by the OS.
+        '''
+
+        for attempt in range(retries):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+                return
+            except OSError:
+                if attempt + 1 >= retries:
+                    return
+                try:
+                    time.sleep(delay)
+                except Exception:
+                    return
 
     def verify_signature(self, cert):
         SPC_PE_IMAGE_DATA_OBJID = '1.3.6.1.4.1.311.2.1.15'
