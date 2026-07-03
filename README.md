@@ -34,10 +34,10 @@ CFF Explorer.exe: Not signed file
 ## Installation
 
 - System: `openssl` (the plugin shells out to it for PKCS#7 verification)
-- Python 3 with [Volatility 3](https://github.com/volatilityfoundation/volatility3) installed, plus `pefile>=2019.4.18`
+- Python 3 with [Volatility 3](https://github.com/volatilityfoundation/volatility3) installed, plus `pefile>=2019.4.18` and `cryptography`
 
 ```
-pip install volatility3 pefile
+pip install volatility3 pefile cryptography
 ```
 
 ## Usage
