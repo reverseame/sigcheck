@@ -26,6 +26,10 @@ import subprocess
 
 from enum import Enum
 
+from cryptography import x509
+from cryptography.hazmat.primitives.serialization import pkcs7
+from cryptography.x509.oid import ExtensionOID, ExtendedKeyUsageOID
+
 CERTIFICATE_REGEX = re.compile(b'\x30.\x30.\x06.(?P<oid_algorithm>.{5,9})\x05\x00\x04(?P<hash_size>.)')
 OPENSSL_REGEX = re.compile(r' *(?P<offset>[0-9]+):d=[0-9]+ +hl=(?P<header_length>[0-9]+) +l= *(?P<length>[0-9]+)')
 
@@ -41,6 +45,10 @@ class ReturnCode(Enum):
     NOT_SIGNED_OR_INCORRECT_IMAGEBASE = (9, 'Not signed file, or incorrect ImageBase during reconstruction')
     NOT_SIGNED = (10, 'Not signed file')
     VERIFICATION_ERROR = (11, 'An error raised during verification process')
+    CERT_KEY_USAGE_MISSING = (12, 'Verification failed (signer certificate lacks the Key Usage extension)')
+    CERT_KEY_USAGE_NOT_CRITICAL = (13, 'Verification failed (signer certificate Key Usage is not marked critical)')
+    CERT_KEY_USAGE_NO_DIGITAL_SIGNATURE = (14, 'Verification failed (signer certificate Key Usage does not allow digital signatures)')
+    CERT_NOT_FOR_CODE_SIGNING = (15, 'Verification failed (signer certificate is not authorized for code signing)')
 
     def __int__(self):
         return self.value[0]
@@ -146,13 +154,115 @@ class SigValidator:
             output = process.communicate()[1].decode("utf-8")
             result = output.split(':')[-1].replace('\n', '')
 
-            if result:
+            if process.returncode == 0:
+                # openssl was invoked with '-purpose any', which disables all
+                # certificate purpose checks. Chain trust is verified, but the
+                # signer certificate is not required to be authorized for code
+                # signing. Enforce the Key Usage / Extended Key Usage
+                # constraints explicitly to reject certificates issued for other
+                # purposes (e.g. client authentication) or with missing/lax
+                # authorization constraints.
+                key_usage_result = self.check_code_signing_key_usage(signature)
+                if key_usage_result is not None:
+                    return key_usage_result
+
                 # Capitalize first letter
+                return result.capitalize() if result else ReturnCode.CERT_VERIFICATION_SUCCESS
+            elif result:
                 return result.capitalize()
             else:
                 return ReturnCode.VERIFICATION_ERROR
         else:
             return ReturnCode.CERT_FORMAT_ERROR
+
+    def check_code_signing_key_usage(self, signature):
+        '''
+        Enforces that the signer certificate is authorized for code signing.
+
+        @param signature: PKCS #7 signed data (DER, i.e. _WIN_CERTIFICATE.bCertificate)
+
+        @return the first ReturnCode describing a Key Usage/EKU weakness found,
+                or None if the signer certificate is authorized for code signing
+                (or the certificate could not be parsed, in which case the
+                openssl result is left untouched).
+        '''
+
+        try:
+            certs = pkcs7.load_der_pkcs7_certificates(signature)
+        except Exception:
+            # Unable to parse the embedded certificates; do not regress the
+            # existing openssl verification result.
+            return None
+
+        cert = self.find_signer_certificate(certs)
+        if cert is None:
+            return None
+
+        # Key Usage must be present, critical and allow digital signatures
+        try:
+            key_usage_ext = cert.extensions.get_extension_for_oid(ExtensionOID.KEY_USAGE)
+        except x509.ExtensionNotFound:
+            return ReturnCode.CERT_KEY_USAGE_MISSING
+
+        if not key_usage_ext.critical:
+            return ReturnCode.CERT_KEY_USAGE_NOT_CRITICAL
+
+        if not key_usage_ext.value.digital_signature:
+            return ReturnCode.CERT_KEY_USAGE_NO_DIGITAL_SIGNATURE
+
+        # Extended Key Usage must include code signing
+        try:
+            eku_ext = cert.extensions.get_extension_for_oid(ExtensionOID.EXTENDED_KEY_USAGE)
+        except x509.ExtensionNotFound:
+            return ReturnCode.CERT_NOT_FOR_CODE_SIGNING
+
+        if ExtendedKeyUsageOID.CODE_SIGNING not in eku_ext.value:
+            return ReturnCode.CERT_NOT_FOR_CODE_SIGNING
+
+        return None
+
+    def find_signer_certificate(self, certs):
+        '''
+        Heuristically selects the end-entity (signer) certificate from the set
+        of certificates embedded in a PKCS #7 structure.
+
+        The signer is a leaf certificate, i.e. one whose subject is not the
+        issuer of any other certificate in the set. Timestamping authority
+        leaves (also embedded by Authenticode) are discarded so that the code
+        signing certificate is returned.
+
+        @param certs: list of cryptography.x509.Certificate
+
+        @return the signer certificate, or None if the set is empty
+        '''
+
+        if not certs:
+            return None
+        if len(certs) == 1:
+            return certs[0]
+
+        issuers = {cert.issuer for cert in certs}
+        leaves = [cert for cert in certs if cert.subject not in issuers] or list(certs)
+
+        candidates = [cert for cert in leaves if not self.is_timestamping_only(cert)]
+        if len(candidates) == 1:
+            return candidates[0]
+
+        pool = candidates or leaves
+        return pool[0]
+
+    def is_timestamping_only(self, cert):
+        '''
+        @return True if the certificate's Extended Key Usage authorizes
+                timestamping but not code signing (i.e. a TSA certificate)
+        '''
+
+        try:
+            eku = cert.extensions.get_extension_for_oid(ExtensionOID.EXTENDED_KEY_USAGE).value
+        except x509.ExtensionNotFound:
+            return False
+
+        return ExtendedKeyUsageOID.TIME_STAMPING in eku and ExtendedKeyUsageOID.CODE_SIGNING not in eku
 
     def extract_cert(self, pe):
         '''
